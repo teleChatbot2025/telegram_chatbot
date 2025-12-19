@@ -1,0 +1,27 @@
+html, body { height: 100%; margin: 0; }
+.gradio-container { height: 100vh; overflow: hidden; }
+.gradio-container .gr-blocks,
+.gradio-container .gr-blocks > .wrap,
+.gradio-container .gr-blocks > .wrap > .container { height: 100%; }
+
+#layout_main_row{
+  height: calc(100vh - 110px);
+  align-items: stretch;
+}
+
+#left_column, #right_column{
+  display: grid;
+  grid-template-rows: minmax(280px, 1fr) auto;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#summary_view, #chat_view{
+  min-height: 0;
+}
+
+#left_panel, #right_panel{
+  overflow: hidden;
+}
+
