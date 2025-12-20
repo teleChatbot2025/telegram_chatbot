@@ -48,7 +48,7 @@ async def on_submit(user_msg, chat_state, scope_state, session_id):
         yield chat_state, chat_state
         return
 
-    async for chat in qa_stream(user_msg, chat_state, session_id):
+    async for chat in qa_stream(user_msg, chat_state, session_id, scope_state):
         yield chat, chat
 
 
