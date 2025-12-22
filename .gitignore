@@ -1,2 +1,23 @@
 .vscode/
-__pycache__
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+*.log
+
+# MCP服务器相关
+data/
+indexes/
+*.json
+*.jsonl
+*.parquet
+*.db
+*.sqlite
+
+# Telegram会话文件
+telegram_session.session
+telegram_session.session-journal
+*.session
+*.session-journal

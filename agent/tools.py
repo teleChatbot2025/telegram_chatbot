@@ -1,8 +1,32 @@
 from typing import Dict, Any, Annotated
+import json
 from langchain_core.tools import tool, InjectedToolArg
 from langchain_core.runnables import RunnableConfig
 
 from agent.tools_registry import get_tool
+
+
+def _parse_mcp_result(result: Any) -> Dict[str, Any]:
+    """Parse MCP tool result."""
+    if isinstance(result, dict):
+        if "type" in result and "text" in result:
+            try:
+                text_content = result.get("text", "")
+                if isinstance(text_content, str):
+                    return json.loads(text_content)
+                else:
+                    return text_content
+            except (json.JSONDecodeError, TypeError):
+                return result
+        else:
+            return result
+    elif isinstance(result, list):
+        if result:
+            return _parse_mcp_result(result[0])
+        else:
+            return {"success": False, "error": "Empty result list"}
+    else:
+        return {"result": result} if result else {"success": False, "error": "Invalid result format"}
 
 
 @tool
@@ -60,8 +84,11 @@ async def scoped_retrieve(
     mcp_retrieve = await get_tool("retrieve")
 
     result = await mcp_retrieve.ainvoke({
-        "scope": scope_state,
-        "query": query
+        "query": query,
+        "channel": scope_state.get("channel", ""),
+        "from_date": scope_state.get("from", ""),
+        "to_date": scope_state.get("to", "")
     })
 
-    return result
+    # Parse MCP result
+    return _parse_mcp_result(result)

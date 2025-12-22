@@ -84,8 +84,24 @@ async def on_analyze(channel, date_from, date_to, summary_md_current, scope_stat
         yield summary_md_current, scope_state
         return
 
-    async for summary_md in analyze_stream(new_scope):
-        yield summary_md, new_scope
+    try:
+        async for summary_md in analyze_stream(new_scope):
+            yield summary_md, new_scope
+    except Exception as e:
+        ch = new_scope.get("channel", "")
+        f = new_scope.get("from", "")
+        t = new_scope.get("to", "")
+        scope_info = f"- Channel: `{ch}`\n- Time range: `{f}` ~ `{t}`\n"
+        error_md = (
+            "## Summary\n\n" + scope_info + "\n"
+            f"❌ **Analysis error**\n\n"
+            f"Error: `{str(e)}`\n\n"
+            "Please check:\n"
+            "- MCP server is running (http://127.0.0.1:22331/mcp)\n"
+            "- Network connection\n"
+            "- Check server logs for details\n"
+        )
+        yield error_md, new_scope
 
 
 def build_ui():

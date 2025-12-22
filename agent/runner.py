@@ -1,10 +1,33 @@
 from typing import Dict, List, Any
-from langchain_core.messages import HumanMessage
+import json
+from langchain_core.messages import HumanMessage, AIMessage
 from agent.core import get_model, setup_agent
 from agent.tools_registry import get_tool
 
-model = get_model()
-qa_agent = setup_agent()
+
+def _parse_mcp_result(result: Any) -> Dict[str, Any]:
+    """Parse MCP tool result. Handles dict, list, and wrapped formats."""
+    if isinstance(result, dict):
+        # Check if wrapped format
+        if "type" in result and "text" in result:
+            try:
+                text_content = result.get("text", "")
+                if isinstance(text_content, str):
+                    parsed = json.loads(text_content)
+                    return parsed
+                else:
+                    return text_content
+            except (json.JSONDecodeError, TypeError):
+                return result
+        else:
+            return result
+    elif isinstance(result, list):
+        if result:
+            return _parse_mcp_result(result[0])
+        else:
+            return {"success": False, "error": "Empty result list"}
+    else:
+        return {"result": result} if result else {"success": False, "error": "Invalid result format"}
 
 
 def _fmt_scope(scope: Dict[str, Any]) -> str:
@@ -28,18 +51,51 @@ async def analyze_stream(scope: dict):
     md = _md_header(scope) + "⏳ Initializing analysis...\n"
     yield md
 
-    fetch_messages = await get_tool("fetch_messages")
-    build_index = await get_tool("build_index")
-    evidence_retrieve = await get_tool("evidence_retrieve")
+    try:
+        fetch_messages = await get_tool("fetch_messages")
+        build_index = await get_tool("build_index")
+        evidence_retrieve = await get_tool("evidence_retrieve")
+    except ConnectionError as e:
+        md = _md_header(scope) + f"❌ **MCP server connection failed**\n\n{str(e)}\n"
+        yield md
+        return
+    except KeyError as e:
+        md = _md_header(scope) + (
+            f"❌ **Tool not found**: {str(e)}\n\n"
+            "Ensure MCP server provides required tools:\n"
+            "- fetch_messages\n"
+            "- build_index\n"
+            "- evidence_retrieve\n"
+        )
+        yield md
+        return
+    except Exception as e:
+        md = _md_header(scope) + f"❌ **Initialization failed**: {str(e)}\n"
+        yield md
+        return
 
     # 1) Fetch messages
     md = _md_header(scope) + "⏳ Fetching messages from Telegram...\n"
     yield md
 
-    fetch_result: Dict[str, Any] = await fetch_messages.ainvoke(scope)
+    # FastMCP requires unpacking dict params
+    fetch_result = await fetch_messages.ainvoke({
+        "channel": scope.get("channel", ""),
+        "from_date": scope.get("from", ""),
+        "to_date": scope.get("to", "")
+    })
 
-    if not fetch_result or fetch_result.get("success") is not True:
-        err = (fetch_result or {}).get("error", "Unknown error")
+    # Parse MCP result (may be wrapped format)
+    fetch_result = _parse_mcp_result(fetch_result)
+
+    if not fetch_result:
+        md = _md_header(scope) + "❌ Fetch failed: Empty result\n"
+        yield md
+        return
+    
+    # Check success field
+    if fetch_result.get("success") is not True:
+        err = fetch_result.get("error", "Unknown error")
         md = _md_header(scope) + f"❌ Fetch failed: `{err}`\n"
         yield md
         return
@@ -55,9 +111,15 @@ async def analyze_stream(scope: dict):
     yield md
 
     # 2) Build index
-    index_result: Dict[str, Any] = await build_index.ainvoke({
-        "raw_path": raw_path, "scope": scope
+    index_result = await build_index.ainvoke({
+        "raw_path": raw_path,
+        "channel": scope.get("channel", ""),
+        "from_date": scope.get("from", ""),
+        "to_date": scope.get("to", "")
     })
+
+    # Parse MCP result
+    index_result = _parse_mcp_result(index_result)
 
     if not index_result or index_result.get("success") is not True:
         err = (index_result or {}).get("error", "Unknown error")
@@ -75,13 +137,28 @@ async def analyze_stream(scope: dict):
     yield md
 
     # 3) Retrieve evidence for summary
-    retrieve_result: Dict[str, Any] = await evidence_retrieve.ainvoke({
-        "scope": scope,
+    retrieve_result = await evidence_retrieve.ainvoke({
         "k": 50,
+        "channel": scope.get("channel", ""),
+        "from_date": scope.get("from", ""),
+        "to_date": scope.get("to", "")
     })
 
-    if not retrieve_result or not retrieve_result.get("success") is not True:
-        err = (retrieve_result or {}).get("error", "Unknown error")
+    # Parse MCP result
+    retrieve_result = _parse_mcp_result(retrieve_result)
+
+    if not retrieve_result:
+        md = _md_header(scope) + "❌ Retrieve failed: Empty result\n"
+        yield md
+        return
+    
+    if retrieve_result.get("success") is not True:
+        err = retrieve_result.get("error", "Unknown error")
+        if err == "Unknown error":
+            if "result" in retrieve_result:
+                err = f"Result: {str(retrieve_result.get('result'))[:200]}"
+            elif isinstance(retrieve_result, dict) and len(retrieve_result) > 0:
+                err = f"Data: {str(retrieve_result)[:200]}"
         md = _md_header(scope) + f"❌ Retrieve failed: `{err}`\n"
         yield md
         return
@@ -121,14 +198,14 @@ async def analyze_stream(scope: dict):
     ai_buf = ""
     base = _md_header(scope)
 
-    init = {"messages": [HumanMessage(content=summarize_prompt)]}
+    messages = [HumanMessage(content=summarize_prompt)]
 
-    async for ev in model.astream_events(init, version="v1"):
-        if ev.get("event") == "on_chat_model_stream":
-            ch = ev.get("data", {}).get("chunk")
-            if ch and getattr(ch, "content", None):
-                ai_buf += ch.content
-                yield base + ai_buf
+    model = get_model()
+    # Stream LLM response
+    async for chunk in model.astream(messages):
+        if hasattr(chunk, "content") and chunk.content:
+            ai_buf += chunk.content
+            yield base + ai_buf
 
     yield base + ai_buf
 
@@ -140,18 +217,67 @@ async def qa_stream(query: str, chat: List[Dict], thread_id: str, scope_state: d
 
     yield chat
 
-    init = {"messages": [HumanMessage(content=query)]}
+    input_messages = [HumanMessage(content=query)]
+    config = {"configurable": {"thread_id": str(thread_id), "scope_state": scope_state}}
 
-    async for ev in qa_agent.astream_events(
-        init,
-        version="v1",
-        config={"configurable": {"thread_id": str(thread_id), "scope_state": scope_state}},
-    ):
-        if ev.get("event") == "on_chat_model_stream":
-            ch = ev.get("data", {}).get("chunk")
-            if ch and getattr(ch, "content", None):
-                ai_buf += ch.content
-                chat[ai_idx]["content"] = ai_buf
-                yield chat
+    qa_agent = setup_agent()
+    
+    # Use astream_events for streaming (more reliable)
+    try:
+        async for event in qa_agent.astream_events(
+            {"messages": input_messages},
+            version="v1",
+            config=config
+        ):
+            if event.get("event") == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk and hasattr(chunk, "content") and chunk.content:
+                    ai_buf += chunk.content
+                    chat[ai_idx]["content"] = ai_buf
+                    yield chat
+            elif event.get("event") == "on_chat_model_end":
+                output = event.get("data", {}).get("output")
+                if output and hasattr(output, "content") and output.content:
+                    ai_buf = output.content
+                    chat[ai_idx]["content"] = ai_buf
+                    yield chat
+    except Exception as e:
+        # Fallback to astream
+        print(f"⚠️ astream_events failed, trying astream: {e}")
+        try:
+            async for chunk in qa_agent.astream(
+                {"messages": input_messages},
+                config=config
+            ):
+                # Process agent output: {node_name: [messages]}
+                if isinstance(chunk, dict):
+                    for node_name, node_output in chunk.items():
+                        if isinstance(node_output, list):
+                            for msg in node_output:
+                                if isinstance(msg, AIMessage):
+                                    if hasattr(msg, "content") and msg.content:
+                                        ai_buf = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                        chat[ai_idx]["content"] = ai_buf
+                                        yield chat
+                        elif isinstance(node_output, AIMessage):
+                            if hasattr(node_output, "content") and node_output.content:
+                                ai_buf = node_output.content if isinstance(node_output.content, str) else str(node_output.content)
+                                chat[ai_idx]["content"] = ai_buf
+                                yield chat
+                        elif isinstance(node_output, dict):
+                            messages = node_output.get("messages", [])
+                            for msg in messages:
+                                if isinstance(msg, AIMessage):
+                                    if hasattr(msg, "content") and msg.content:
+                                        ai_buf = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                        chat[ai_idx]["content"] = ai_buf
+                                        yield chat
+        except Exception as e2:
+            error_msg = f"Agent execution failed: {str(e2)}"
+            chat[ai_idx]["content"] = f"❌ {error_msg}\n\nPlease check:\n1. DEEPSEEK_API_TOKEN is set\n2. Network connection\n3. Check console logs"
+            yield chat
+            print(f"❌ Agent error: {e2}")
+            import traceback
+            traceback.print_exc()
 
     yield chat
