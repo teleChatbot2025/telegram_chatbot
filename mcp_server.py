@@ -105,6 +105,16 @@ def get_scope_id(scope: Dict[str, Any]) -> str:
     return f"{channel}_{date_from}_{date_to}".replace("@", "").replace("/", "_")
 
 
+# ---------------------------
+# RAG chunking 
+# ---------------------------
+MAX_CHARS = int(os.getenv("RAG_MAX_CHARS", "1000"))
+OVERLAP = int(os.getenv("RAG_OVERLAP", "200"))
+MIN_MERGE_CHARS = int(os.getenv("RAG_MIN_MERGE_CHARS", "300"))
+MERGE_GAP_SECONDS = int(os.getenv("RAG_MERGE_GAP_SECONDS", "300"))
+MAX_MERGE_COUNT = int(os.getenv("RAG_MAX_MERGE_COUNT", "10"))
+
+
 async def fetch_telegram_messages(scope: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Fetch messages from Telegram using Telethon."""
     from datetime import datetime
@@ -293,25 +303,169 @@ async def build_index(
                 "error": "Message data is empty"
             }
         
-        texts = []
-        metadatas = []
-        
-        for msg in messages:
+        # -------------------------
+        # message chunking
+        # -------------------------
+        texts: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+
+        def _split_long_text_into_chunks(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> List[str]:
+            """Split a long text into sliding-window character chunks."""
+            if not text:
+                return []
+            L = len(text)
+            if L <= max_chars:
+                return [text]
+            chunks = []
+            start = 0
+            while start < L:
+                end = start + max_chars
+                chunks.append(text[start:end])
+                if end >= L:
+                    break
+                start = max(0, end - overlap)
+            return chunks
+
+        # Variables for merging short messages
+        merged_buffer = ""
+        merged_ids: List[Any] = []
+        merged_sender_ids: List[Any] = []
+        merged_start_ts = None
+        merged_end_ts = None
+        merged_count = 0
+
+        def flush_merged_buffer():
+            """Flush the merged buffer into texts/metadatas as a single chunk."""
+            nonlocal merged_buffer, merged_ids, merged_sender_ids, merged_start_ts, merged_end_ts, merged_count
+            if not merged_buffer:
+                return
+            meta = {
+                "message_id": merged_ids[0] if merged_ids else "",
+                "timestamp": merged_start_ts if merged_start_ts else "",
+                "sender_id": merged_sender_ids[0] if merged_sender_ids else "",
+                "chunk_index": 0,
+                "scope_id": get_scope_id(scope),
+                "merged_message_ids": merged_ids.copy(),
+                "merged_count": merged_count,
+                "start_timestamp": merged_start_ts,
+                "end_timestamp": merged_end_ts,
+            }
+            texts.append(merged_buffer)
+            metadatas.append(meta)
+            # reset
+            merged_buffer = ""
+            merged_ids = []
+            merged_sender_ids = []
+            merged_start_ts = None
+            merged_end_ts = None
+            merged_count = 0
+
+        # iterate messages 
+        for idx, msg in enumerate(messages):
             text = msg.get("text", "")
             if not text:
                 continue
-            
-            chunks = text_splitter.split_text(text)
-            
-            for i, chunk in enumerate(chunks):
-                texts.append(chunk)
-                metadatas.append({
-                    "message_id": msg.get("id", ""),
-                    "timestamp": msg.get("date", ""),
-                    "sender_id": msg.get("sender_id", ""),
-                    "chunk_index": i,
-                    "scope_id": get_scope_id(scope),
-                })
+            text = text.strip()
+            # get time
+            try:
+                msg_ts = int(msg.get("timestamp", 0))
+            except Exception:
+                try:
+                    msg_ts = int(datetime.fromisoformat(msg.get("date")).timestamp())
+                except Exception:
+                    msg_ts = 0
+
+            # split long messages
+            if len(text) >= MAX_CHARS:
+                
+                flush_merged_buffer()
+                long_chunks = _split_long_text_into_chunks(text, MAX_CHARS, OVERLAP)
+                for i, chunk in enumerate(long_chunks):
+                    meta = {
+                        "message_id": msg.get("id", ""),
+                        "timestamp": msg.get("date", ""),
+                        "sender_id": msg.get("sender_id", ""),
+                        "chunk_index": i,
+                        "scope_id": get_scope_id(scope),
+                    }
+                    texts.append(chunk)
+                    metadatas.append(meta)
+                continue
+
+            # or, consider merging with old short messages
+            if merged_count == 0:
+                # start a new merged buffer
+                merged_buffer = text
+                merged_ids = [msg.get("id", "")]
+                merged_sender_ids = [msg.get("sender_id", "")]
+                merged_start_ts = msg.get("date", "")
+                merged_end_ts = msg.get("date", "")
+                merged_count = 1
+            else:
+                try:
+                    prev_ts_int = int(merged_end_ts) if isinstance(merged_end_ts, int) else int(datetime.fromisoformat(merged_end_ts).timestamp())
+                except Exception:
+                    prev_ts_int = 0
+                # compute gap
+                gap = abs(msg_ts - prev_ts_int) if msg_ts and prev_ts_int else 0
+                # decide whether to flush previous buffer
+                if (MERGE_GAP_SECONDS and gap > MERGE_GAP_SECONDS) or merged_count >= MAX_MERGE_COUNT:
+                    flush_merged_buffer()
+                    merged_buffer = text
+                    merged_ids = [msg.get("id", "")]
+                    merged_sender_ids = [msg.get("sender_id", "")]
+                    merged_start_ts = msg.get("date", "")
+                    merged_end_ts = msg.get("date", "")
+                    merged_count = 1
+                else:
+                    # merge into buffer (separate messages by newline to preserve boundaries)
+                    merged_buffer = merged_buffer + "\n" + text
+                    merged_ids.append(msg.get("id", ""))
+                    merged_sender_ids.append(msg.get("sender_id", ""))
+                    merged_end_ts = msg.get("date", "")
+                    merged_count += 1
+
+            # If merged buffer large enough, flush (or split if too large)
+            if len(merged_buffer) >= MIN_MERGE_CHARS:
+                if len(merged_buffer) <= MAX_CHARS:
+                    flush_merged_buffer()
+                else:
+                    parts = _split_long_text_into_chunks(merged_buffer, MAX_CHARS, OVERLAP)
+                    for i, part in enumerate(parts):
+                        meta = {
+                            "message_id": merged_ids[0] if merged_ids else "",
+                            "timestamp": merged_start_ts if merged_start_ts else "",
+                            "sender_id": merged_sender_ids[0] if merged_sender_ids else "",
+                            "chunk_index": i,
+                            "scope_id": get_scope_id(scope),
+                            "merged_message_ids": merged_ids.copy(),
+                            "merged_count": merged_count,
+                            "start_timestamp": merged_start_ts,
+                            "end_timestamp": merged_end_ts,
+                        }
+                        texts.append(part)
+                        metadatas.append(meta)
+                    # reset after splitting
+                    merged_buffer = ""
+                    merged_ids = []
+                    merged_sender_ids = []
+                    merged_start_ts = None
+                    merged_end_ts = None
+                    merged_count = 0
+
+        # after loop, flush any remaining merged buffer
+        flush_merged_buffer()
+
+        # -------------------------
+        # message chunking
+        # -------------------------
+
+        # texts/metadatas length must match
+        if len(texts) != len(metadatas):
+            return {
+                "success": False,
+                "error": f"Internal error: texts/metadatas length mismatch: {len(texts)} vs {len(metadatas)}"
+            }
         
         if not texts:
             return {
@@ -325,7 +479,15 @@ async def build_index(
                 "error": "Embedding model not initialized"
             }
         
+        # compute embeddings
         embeddings_list = await embedding_model.aembed_documents(texts)
+
+        # ensure embeddings align
+        if len(embeddings_list) != len(texts):
+            return {
+                "success": False,
+                "error": f"Internal error: embeddings length {len(embeddings_list)} != texts length {len(texts)}"
+            }
         
         scope_id = get_scope_id(scope)
         collection_name = f"telegram_{scope_id}"
@@ -361,7 +523,37 @@ async def build_index(
                     )
             else:
                 raise
-        
+
+        # ---------- sanitize metadatas ----------
+        def _sanitize_metadatas(metadatas_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            """Ensure each metadata value is a primitive (str,int,float,bool,None) or None.
+               Convert lists/dicts/others to JSON strings, datetime-like to isoformat."""
+            sanitized_list = []
+            for meta in metadatas_in:
+                clean = {}
+                for k, v in meta.items():
+                    # allow primitives directly
+                    if v is None or isinstance(v, (str, int, float, bool)):
+                        clean[k] = v
+                        continue
+                    # datetime-like -> isoformat
+                    try:
+                        if hasattr(v, "isoformat"):
+                            clean[k] = v.isoformat()
+                            continue
+                    except Exception:
+                        pass
+                    # lists/dicts/other -> json string with ensure_ascii=False
+                    try:
+                        clean[k] = json.dumps(v, ensure_ascii=False)
+                    except Exception:
+                        # fallback to str()
+                        clean[k] = str(v)
+                sanitized_list.append(clean)
+            return sanitized_list
+
+        metadatas = _sanitize_metadatas(metadatas)
+
         ids = [f"{scope_id}_{i}" for i in range(len(texts))]
         collection.add(
             embeddings=embeddings_list,
@@ -539,7 +731,7 @@ async def retrieve(
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Starting MCP server...")
+    print("Starting RAG server...")
     print("=" * 60)
     print(f"Data directory: {DATA_DIR.absolute()}")
     print(f"Index directory: {INDEXES_DIR.absolute()}")
@@ -554,4 +746,3 @@ if __name__ == "__main__":
     print("\nPress Ctrl+C to stop server\n")
     
     mcp.run(transport="http", host="0.0.0.0", port=22331)
-
